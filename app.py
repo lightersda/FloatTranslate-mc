@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, font as tkfont
 
@@ -37,6 +38,27 @@ ACCENT = "#3b6ef5"
 VEIL = "#808080"
 VEIL_ALPHA = 0.4
 
+# OCR modes: "windows" = built-in Windows OCR; "llm" = send the screenshot
+# image straight to the model (vision) and get the translation in one call.
+OCR_MODES = {
+    "windows": "Windows 内置 OCR",
+    "llm": "直接发给模型（一步出译文）",
+}
+
+# Frame-differencing auto mode ("frame"): poll cheaply at FRAME_POLL_MS and diff
+# a tiny downscaled grayscale proxy of the capture region; translate only after
+# the content has been stable for STABLE_TICKS. MAX_CHANGE_MS forces a
+# translation for never-stabilizing content (video, spinners) so auto mode
+# doesn't stall.
+FRAME_POLL_MS = 400
+STABLE_TICKS = 2
+MAX_CHANGE_MS = 3000
+PROXY_SIZE = (80, 45)
+AUTO_MODES = {
+    "plain": "常规（按间隔翻译）",
+    "frame": "帧变化检测（稳定后翻译）",
+}
+
 
 def _enable_dpi_awareness() -> None:
     """Make Tk coordinates map 1:1 to physical pixels so capture aligns."""
@@ -52,6 +74,8 @@ def _enable_dpi_awareness() -> None:
 class FloatTranslate:
     def __init__(self) -> None:
         self.cfg = Config.load()
+        # Apply the configurable base URL for the local provider.
+        providers.get_provider("local").set_base_url(self.cfg.local_base_url)
         self._translator: Translator | None = None
         self._translator_signature: tuple | None = None
         self._busy = False
@@ -62,6 +86,12 @@ class FloatTranslate:
         self._minimized = False
         self._ball: tk.Toplevel | None = None
         self._veil_win: tk.Toplevel | None = None
+        # Frame-differencing auto mode state.
+        self._proxy_seen: bytes | None = None
+        self._proxy_done: bytes | None = None
+        self._pending_frame: Image.Image | None = None
+        self._stable_count = 0
+        self._changing_since: float | None = None
 
         self.root = tk.Tk()
         self.root.title("FloatTranslate")
@@ -225,7 +255,7 @@ class FloatTranslate:
         provider = self.cfg.provider
         key = self.cfg.resolved_api_key(provider)
         signature = (provider, key, self.cfg.model, self.cfg.target_language)
-        if not key:
+        if not key and providers.requires_key(provider):
             return None
         if signature != self._translator_signature:
             self._translator = Translator(
@@ -247,7 +277,7 @@ class FloatTranslate:
     def translate_once(self):
         self._scan(force=True)
 
-    def _scan(self, force: bool):
+    def _scan(self, force: bool, img: Image.Image | None = None):
         if self._busy or self._minimized:
             return
         translator = self._ensure_translator()
@@ -256,7 +286,8 @@ class FloatTranslate:
             if force:
                 self.open_settings()
             return
-        img = self._grab_capture()
+        if img is None:
+            img = self._grab_capture()
         if img is None:
             return
 
@@ -266,17 +297,20 @@ class FloatTranslate:
             target=self._worker, args=(translator, img, force), daemon=True
         ).start()
 
-    def _grab_capture(self) -> Image.Image | None:
+    def _grab_capture(self, flash: bool = True) -> Image.Image | None:
         """Screenshot the capture region, momentarily hiding the gray veil so
         only the content behind the window is captured. Runs on the UI thread
-        (the grab itself is fast; OCR/translation happen in the worker)."""
+        (the grab itself is fast; OCR/translation happen in the worker).
+
+        `flash=False` keeps the veil (used by frame-differencing ticks, where
+        the constant tint is fine for diffing and flashing would flicker)."""
         bbox = self._capture_bbox()
         if bbox is None:
             return None
         # Flash the overlay invisible so the screenshot sees only the content
         # behind the window, then restore it.
         veil = self._veil_win
-        if veil is not None:
+        if veil is not None and flash:
             veil.attributes("-alpha", 0)
             veil.update_idletasks()
         try:
@@ -284,7 +318,7 @@ class FloatTranslate:
                 shot = sct.grab(bbox)
             return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
         finally:
-            if veil is not None:
+            if veil is not None and flash:
                 veil.attributes("-alpha", VEIL_ALPHA)
 
     def _worker(self, translator: Translator, img: Image.Image, force: bool):
@@ -294,6 +328,21 @@ class FloatTranslate:
                 self.root.after(0, lambda: self._finish(None, None))
                 return
             self._last_image_hash = img_hash
+
+            if self.cfg.ocr_mode == "llm":
+                # One-shot: the screenshot goes straight to the model, which
+                # returns the translation directly (no separate local OCR).
+                self.root.after(0, lambda: self._set_status("识别翻译中…", "#fdd663"))
+                translated = translator.translate_image(img)
+                if not translated:
+                    self.root.after(0, lambda: self._finish("（未识别到文字）", None))
+                    return
+                if not force and translated == self._last_text:
+                    self.root.after(0, lambda: self._finish(None, None))
+                    return
+                self._last_text = translated
+                self.root.after(0, lambda: self._finish(translated, None))
+                return
 
             text = ocr.recognize(img, self.cfg.ocr_language or None).strip()
             if not text:
@@ -331,12 +380,75 @@ class FloatTranslate:
         elif self._auto_job:
             self.root.after_cancel(self._auto_job)
             self._auto_job = None
+            self._reset_frame_state()
 
     def _auto_tick(self):
         if not self._auto:
             return
-        self._scan(force=False)
-        self._auto_job = self.root.after(self.cfg.auto_interval_ms, self._auto_tick)
+        if self.cfg.auto_mode == "frame":
+            self._scan_frame()
+            self._auto_job = self.root.after(FRAME_POLL_MS, self._auto_tick)
+        else:
+            self._scan(force=False)
+            self._auto_job = self.root.after(self.cfg.auto_interval_ms, self._auto_tick)
+
+    def _proxy(self, img: Image.Image) -> bytes:
+        """Tiny downscaled grayscale fingerprint of the capture region."""
+        return img.convert("L").resize(PROXY_SIZE).tobytes()
+
+    def _scan_frame(self):
+        """帧变化检测自动模式：代理帧比对 + 稳定防抖，内容稳定后才翻译。"""
+        if self._busy or self._minimized:
+            return
+        translator = self._ensure_translator()
+        if translator is None:
+            self._set_status("未设置 API Key", "#f28b82")
+            return
+        # Diff grab keeps the veil (constant tint) to avoid flicker at 400ms.
+        img = self._grab_capture(flash=False)
+        if img is None:
+            return
+
+        proxy = self._proxy(img)
+        now = time.time()
+
+        if proxy == self._proxy_seen:
+            # 画面无变化：累积稳定帧数，够了就翻译最近一帧
+            if self._pending_frame is not None:
+                self._stable_count += 1
+                if self._stable_count >= STABLE_TICKS:
+                    self._fire_auto_translate(self._pending_frame, proxy)
+            return
+
+        # 画面有变化
+        if self._pending_frame is None:
+            self._changing_since = now  # 记录连续变化的起点
+        self._proxy_seen = proxy
+        self._pending_frame = img
+        self._stable_count = 0
+
+        # 持续变化超时兜底（动画/视频等永不稳定的内容）
+        if (self._changing_since is not None
+                and now - self._changing_since > MAX_CHANGE_MS / 1000.0):
+            self._fire_auto_translate(img, proxy)
+
+    def _fire_auto_translate(self, frame: Image.Image, proxy: bytes):
+        self._pending_frame = None
+        self._stable_count = 0
+        self._changing_since = None
+        if proxy == self._proxy_done:
+            return  # 同一内容已翻译过
+        self._proxy_done = proxy
+        # Re-grab with the veil flashed away for the actual translation frame.
+        clean = self._grab_capture()
+        self._scan(force=False, img=clean or frame)
+
+    def _reset_frame_state(self):
+        self._proxy_seen = None
+        self._proxy_done = None
+        self._pending_frame = None
+        self._stable_count = 0
+        self._changing_since = None
 
     # ----------------------------------------------------------- settings ----
     def open_settings(self):
@@ -461,7 +573,12 @@ class SettingsDialog:
         self.var_model = tk.StringVar(value=cfg.model)
         self.var_target = tk.StringVar(value=cfg.target_language)
         self.var_ocr = tk.StringVar(value=cfg.ocr_language or "（自动）")
+        self.var_ocr_mode = tk.StringVar(value=OCR_MODES.get(cfg.ocr_mode, "windows"))
+        self.ocr_mode_to_id = {v: k for k, v in OCR_MODES.items()}
+        self.var_local_url = tk.StringVar(value=cfg.local_base_url)
         self.var_interval = tk.StringVar(value=str(cfg.auto_interval_ms))
+        self.var_auto_mode = tk.StringVar(value=AUTO_MODES.get(cfg.auto_mode, "plain"))
+        self.auto_mode_to_id = {v: k for k, v in AUTO_MODES.items()}
 
         r = 0
         # --- provider ---
@@ -472,6 +589,17 @@ class SettingsDialog:
         self.cmb_provider.grid(row=r, column=1, sticky="ew", padx=(10, 0), pady=4)
         self.cmb_provider.bind("<<ComboboxSelected>>", self._on_provider_change)
         r += 1
+
+        # --- local model base URL (only shown for 本地模型) ---
+        self.lbl_local_url = tk.Label(top, text="本地模型 URL", bg=BAR_BG,
+                                      fg=BAR_FG, font=("Segoe UI", 9))
+        self.lbl_local_url.grid(row=r, column=0, sticky="w", pady=4)
+        self.ent_local_url = tk.Entry(top, textvariable=self.var_local_url, width=33)
+        self.ent_local_url.grid(row=r, column=1, sticky="ew", padx=(10, 0), pady=4)
+        r += 1
+        if cfg.provider != "local":
+            self.lbl_local_url.grid_remove()
+            self.ent_local_url.grid_remove()
 
         # --- api key ---
         self._label(top, "API Key", r)
@@ -513,16 +641,36 @@ class SettingsDialog:
             row=r, column=1, sticky="ew", padx=(10, 0), pady=4)
         r += 1
 
+        # --- ocr mode ---
+        self._label(top, "识别方式", r)
+        ttk.Combobox(top, textvariable=self.var_ocr_mode,
+                     values=list(OCR_MODES.values()), state="readonly",
+                     width=30).grid(
+            row=r, column=1, sticky="ew", padx=(10, 0), pady=4)
+        r += 1
+
         # --- auto interval ---
         self._label(top, "自动间隔 (毫秒)", r)
         tk.Entry(top, textvariable=self.var_interval, width=33).grid(
             row=r, column=1, sticky="ew", padx=(10, 0), pady=4)
         r += 1
 
+        # --- auto mode ---
+        self._label(top, "自动模式", r)
+        ttk.Combobox(top, textvariable=self.var_auto_mode,
+                     values=list(AUTO_MODES.values()), state="readonly",
+                     width=30).grid(
+            row=r, column=1, sticky="ew", padx=(10, 0), pady=4)
+        r += 1
+
         hint = tk.Label(
             top, fg="#9aa0a6", bg=BAR_BG, font=("Segoe UI", 8), justify="left",
             text="留空 API Key 时将使用对应环境变量（如 OPENAI_API_KEY）。\n"
-                 "点「验证并获取模型」可校验 Key 并拉取可用模型列表。",
+                 "点「验证并获取模型」可校验 Key 并拉取可用模型列表。\n"
+                 "「本地模型」为本地 OpenAI 兼容服务（如 LM Studio），可不填 Key。\n"
+                 "「直接发给模型」会把截图（JPEG）直发模型一步出译文，"
+                 "仅 OpenAI 支持，且会消耗 API 额度。\n"
+                 "「帧变化检测」自动模式：画面稳定后才翻译，轮询更省、不闪动。",
         )
         hint.grid(row=r, column=0, columnspan=2, sticky="w", pady=(8, 0))
         r += 1
@@ -551,6 +699,13 @@ class SettingsDialog:
         self.keys[self._current_pid] = self.var_api_key.get().strip()
         self._current_pid = self._label_to_id[self.var_provider.get()]
         self.var_api_key.set(self.keys.get(self._current_pid, ""))
+        # Show the base-URL field only for the local provider.
+        if self._current_pid == "local":
+            self.lbl_local_url.grid()
+            self.ent_local_url.grid()
+        else:
+            self.lbl_local_url.grid_remove()
+            self.ent_local_url.grid_remove()
         models = self._initial_models(self._current_pid, "")
         self.cmb_model.configure(values=models)
         if self.var_model.get() not in models:
@@ -563,7 +718,7 @@ class SettingsDialog:
             return
         pid = self._current_pid
         key = self.var_api_key.get().strip() or self.app.cfg.resolved_api_key(pid)
-        if not key:
+        if not key and providers.requires_key(pid):
             self._set_validate("请先填入 API Key", "#f28b82")
             return
         self._validating = True
@@ -603,16 +758,22 @@ class SettingsDialog:
         cfg = self.app.cfg
         self.keys[self._current_pid] = self.var_api_key.get().strip()
         cfg.provider = self._current_pid
+        cfg.local_base_url = self.var_local_url.get().strip() or cfg.local_base_url
+        providers.get_provider("local").set_base_url(cfg.local_base_url)
+        self.models_cache.pop("local", None)
         cfg.api_keys = dict(self.keys)
         cfg.api_key = ""  # legacy field now lives in api_keys
         cfg.model = self.var_model.get().strip() or cfg.model
         cfg.target_language = self.var_target.get().strip() or cfg.target_language
         ocr_lang = self.var_ocr.get().strip()
         cfg.ocr_language = "" if ocr_lang in ("", "（自动）") else ocr_lang
+        cfg.ocr_mode = self.ocr_mode_to_id.get(self.var_ocr_mode.get(), "windows")
         try:
             cfg.auto_interval_ms = max(400, int(self.var_interval.get()))
         except ValueError:
             pass
+        cfg.auto_mode = self.auto_mode_to_id.get(self.var_auto_mode.get(), "plain")
+        self.app._reset_frame_state()
         cfg.save()
         # Force translator rebuild with new settings.
         self.app._translator_signature = None

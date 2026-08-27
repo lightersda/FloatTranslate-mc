@@ -29,6 +29,14 @@ class Config:
     target_language: str = "简体中文"
     # OCR source language (BCP-47). Empty = use Windows user-profile languages.
     ocr_language: str = ""
+    # OCR mode: "windows" = built-in Windows OCR; "llm" = send the screenshot
+    # image straight to the model (vision) and get the translation in one call.
+    ocr_mode: str = "windows"
+    # Base URL of the local OpenAI-compatible server (LM Studio etc.).
+    local_base_url: str = "http://127.0.0.1:1234/v1"
+    # Auto mode: "plain" = translate every interval tick; "frame" = frame
+    # differencing: translate only after the captured region stabilizes.
+    auto_mode: str = "plain"
     # Auto mode: re-scan the capture region every N milliseconds.
     auto_interval_ms: int = 1500
     # Window geometry "WxH+X+Y" remembered between runs.

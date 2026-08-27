@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import httpx
 
-_TIMEOUT = httpx.Timeout(30.0)
+# 120s: cloud APIs answer fast, but local vision models can take a while.
+_TIMEOUT = httpx.Timeout(120.0)
 
 
 class ProviderError(RuntimeError):
@@ -22,11 +23,18 @@ class ProviderError(RuntimeError):
 class Provider:
     id: str = ""
     label: str = ""
+    # Local servers (LM Studio etc.) accept any/empty keys.
+    requires_key: bool = True
 
     def list_models(self, api_key: str) -> list[str]:
         raise NotImplementedError
 
     def translate(self, api_key: str, model: str, system: str, text: str) -> str:
+        raise NotImplementedError
+
+    def translate_image(self, api_key: str, model: str, system: str,
+                        image_b64: str, media_type: str,
+                        user_text: str = "") -> str:
         raise NotImplementedError
 
     # ---- shared HTTP helpers --------------------------------------------- #
@@ -99,13 +107,24 @@ class AnthropicProvider(Provider):
 class OpenAICompatProvider(Provider):
     """Any vendor exposing the OpenAI /v1 chat + models endpoints."""
 
-    def __init__(self, id: str, label: str, base_url: str, chat_filter: bool = False):
+    def __init__(self, id: str, label: str, base_url: str, chat_filter: bool = False,
+                 vision: bool = False, requires_key: bool = True):
         self.id = id
         self.label = label
         self._base = base_url.rstrip("/")
         self._chat_filter = chat_filter
+        self.vision = vision
+        self.requires_key = requires_key
+
+    def set_base_url(self, url: str) -> None:
+        """Re-point this provider's endpoint (used for the configurable
+        本地模型 base URL)."""
+        if url:
+            self._base = url.rstrip("/")
 
     def _headers(self, api_key: str) -> dict:
+        if not api_key:
+            return {}  # local servers (LM Studio) accept requests without auth
         return {"Authorization": f"Bearer {api_key}"}
 
     def list_models(self, api_key: str) -> list[str]:
@@ -135,10 +154,50 @@ class OpenAICompatProvider(Provider):
         }
         data = self._request("POST", f"{self._base}/chat/completions",
                              headers=self._headers(api_key), json_body=body)
+        return self._extract(data)
+
+    @staticmethod
+    def _extract(data: dict) -> str:
         choices = data.get("choices") or []
         if not choices:
             raise ProviderError("无返回结果")
-        return (choices[0].get("message", {}).get("content") or "").strip()
+        content = choices[0].get("message", {}).get("content")
+        if isinstance(content, list):  # some servers return content parts
+            return "".join(
+                p.get("text", "") for p in content if isinstance(p, dict)
+            ).strip()
+        return (content or "").strip()
+
+    def translate_image(self, api_key: str, model: str, system: str,
+                        image_b64: str, media_type: str,
+                        user_text: str = "") -> str:
+        """One-shot vision path: the screenshot is sent to the model, which
+        returns the translation directly (OpenAI-compatible chat endpoint).
+
+        The image comes before the text instruction (the convention Qwen-style
+        vision models expect); low temperature keeps repeated auto-scans
+        deterministic so unchanged frames hit the app's dedupe.
+        """
+        if not self.vision:
+            raise ProviderError("当前服务商不支持图片直读（仅 OpenAI 支持）")
+        data_url = f"data:{media_type};base64,{image_b64}"
+        body = {
+            "model": model,
+            "max_tokens": 256,
+            "temperature": 0.1,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": data_url, "detail": "high"}},
+                    {"type": "text",
+                     "text": user_text or "请识别并翻译图中文字，直接输出译文。"},
+                ]},
+            ],
+        }
+        data = self._request("POST", f"{self._base}/chat/completions",
+                             headers=self._headers(api_key), json_body=body)
+        return self._extract(data)
 
 
 # --------------------------------------------------------------------------- #
@@ -181,7 +240,9 @@ _PROVIDERS: dict[str, Provider] = {
     p.id: p for p in (
         AnthropicProvider(),
         OpenAICompatProvider("openai", "OpenAI", "https://api.openai.com/v1",
-                             chat_filter=True),
+                             chat_filter=True, vision=True),
+        OpenAICompatProvider("local", "本地模型", "http://127.0.0.1:1234/v1",
+                             vision=True, requires_key=False),
         OpenAICompatProvider("deepseek", "DeepSeek", "https://api.deepseek.com/v1"),
         GoogleProvider(),
     )
@@ -192,6 +253,7 @@ _DEFAULT_MODELS: dict[str, list[str]] = {
     "anthropic": ["claude-haiku-4-5-20251001", "claude-sonnet-4-6",
                   "claude-opus-4-8"],
     "openai": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
+    "local": ["qwen3vl-4b-instruct", "qwen/qwen3.5-9b"],
     "deepseek": ["deepseek-chat", "deepseek-reasoner"],
     "google": ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
 }
@@ -219,6 +281,11 @@ def get_provider(provider_id: str) -> Provider:
 def provider_label(provider_id: str) -> str:
     p = _PROVIDERS.get(provider_id)
     return p.label if p else provider_id
+
+
+def requires_key(provider_id: str) -> bool:
+    """Whether `provider_id` needs a real API key (False for local servers)."""
+    return get_provider(provider_id).requires_key
 
 
 def default_models(provider_id: str) -> list[str]:

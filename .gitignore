@@ -16,3 +16,7 @@ config.json
 .claude/
 .DS_Store
 Thumbs.db
+
+# Local backups / old copies (not part of the project)
+FloatTranslate-main/
+app_old.py
